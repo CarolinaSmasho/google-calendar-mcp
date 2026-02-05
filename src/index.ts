@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { fileURLToPath } from "url";
 import { GoogleCalendarMcpServer } from './server.js';
 import { parseArgs } from './config/TransportConfig.js';

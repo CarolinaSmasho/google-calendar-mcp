@@ -4,6 +4,11 @@ import http from "http";
 import { TokenManager } from "../auth/tokenManager.js";
 import { CalendarRegistry } from "../services/CalendarRegistry.js";
 import { renderAuthSuccess, renderAuthError, loadWebFile } from "../web/templates.js";
+import { ListEventsHandler } from "../handlers/core/ListEventsHandler.js";
+import { CreateEventHandler } from "../handlers/core/CreateEventHandler.js";
+import { UpdateEventHandler } from "../handlers/core/UpdateEventHandler.js";
+import { DeleteEventHandler } from "../handlers/core/DeleteEventHandler.js";
+import { CalendarRegistry } from "../services/CalendarRegistry.js";
 
 /**
  * Security headers for HTML responses
@@ -418,6 +423,244 @@ export class HttpTransportHandler {
           timestamp: new Date().toISOString()
         }));
         return;
+      }
+
+      // REST API for Frontend - List Events
+      if (req.method === 'GET' && (req.url === '/api/events' || req.url?.startsWith('/api/events?'))) {
+        try {
+          // Check authentication using same logic as manage-accounts
+          const accounts = await this.tokenManager.loadAllAccounts();
+          if (accounts.size === 0) {
+             res.writeHead(401, { 'Content-Type': 'application/json' });
+             res.end(JSON.stringify({ error: 'Not authenticated' }));
+             return;
+          }
+
+          const url = new URL(req.url, `http://${host}:${port}`);
+          const timeMin = url.searchParams.get('timeMin') || undefined;
+          const timeMax = url.searchParams.get('timeMax') || undefined;
+          const calendarId = url.searchParams.get('calendarId') || 'primary'; // Default to primary 
+          // Note: Frontend currently assumes it gets events from "primary" or all. 
+          // For now, let's default to "primary" if not specified, or we could fetch from all if we want to be smart.
+          // But ListEventsHandler expects calendarId.
+          
+          const handler = new ListEventsHandler();
+          // We need to inject CalendarRegistry if it's not a singleton accessed internally by BaseToolHandler?
+          // BaseToolHandler uses CalendarRegistry.getInstance(), so we are good.
+
+          // We'll fetch from all accounts if no specific account is requested
+          // But ListEventsHandler logic handles account=undefined by merging (if we implemented it that way, let's check).
+          // Re-reading ListEventsHandler: "Get clients for specified accounts (supports single or multiple)... merging all events".
+          // So passing account: undefined is correct for "all accounts".
+
+          const result = await handler.runTool({
+            calendarId: calendarId, // This might need to be 'primary' for each account? 
+            // If we pass 'primary', ListEventsHandler will try to find 'primary' calendar on all accounts?
+            // ListEventsHandler: "Normalize calendarId... resolveCalendarsToAccounts...".
+            // If we pass 'primary', it maps to primary calendar of each account.
+            timeMin,
+            timeMax,
+          }, accounts);
+
+          // The result is CallToolResult { content: [{ type: 'text', text: JSON_STRING }] }
+          // We need to parse the text back to JSON to send as response, or just send the text directly.
+          if (result.content[0].type === 'text') {
+             res.writeHead(200, { 'Content-Type': 'application/json' });
+             res.end(result.content[0].text);
+          } else {
+             throw new Error('Unexpected result format from handler');
+          }
+
+        } catch (error) {
+           res.writeHead(500, { 'Content-Type': 'application/json' });
+           res.end(JSON.stringify({
+             error: 'Failed to fetch events',
+             message: error instanceof Error ? error.message : String(error)
+           }));
+        }
+        return;
+      }
+
+     if (req.method === 'GET' && (req.url?.startsWith('/api/events-range'))) {
+         try {
+           const accounts = await this.tokenManager.loadAllAccounts();
+           if (accounts.size === 0) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Not authenticated' }));
+              return;
+           }
+
+           const url = new URL(req.url, `http://${host}:${port}`);
+           const start = url.searchParams.get('start');
+           const end = url.searchParams.get('end');
+
+           if (!start || !end) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Missing start or end parameters' }));
+              return;
+           }
+
+           const handler = new ListEventsHandler();
+           // Fetch from 'primary' calendar of all accounts
+           const result = await handler.runTool({
+             calendarId: 'primary',
+             timeMin: start,
+             timeMax: end
+           }, accounts);
+
+           if (result.content[0].type === 'text') {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(result.content[0].text);
+           } else {
+              throw new Error('Unexpected result format from handler');
+           }
+         } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              error: 'Failed to fetch events range',
+              message: error instanceof Error ? error.message : String(error)
+            }));
+         }
+         return;
+      }
+
+      // POST /api/events - Create new event
+      if (req.method === 'POST' && (req.url?.startsWith('/api/events'))) {
+         try {
+           const accounts = await this.tokenManager.loadAllAccounts();
+           if (accounts.size === 0) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Not authenticated' }));
+              return;
+           }
+
+           const body = await this.parseRequestBody(req);
+           const handler = new CreateEventHandler();
+           
+           // Ensure calendarId is set if not provided (default to primary)
+           const args = {
+             calendarId: 'primary',
+             ...body
+           };
+
+           const result = await handler.runTool(args, accounts);
+
+           // CreateEventHandler returns a JSON string in content[0].text
+           if (result.content[0].type === 'text') {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(result.content[0].text);
+           } else {
+              throw new Error('Unexpected result format from handler');
+           }
+         } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              error: 'Failed to create event',
+              message: error instanceof Error ? error.message : String(error)
+            }));
+         }
+         return;
+      }
+
+       // PATCH /api/events/:eventId - Update event
+      if (req.method === 'PATCH' && (req.url?.startsWith('/api/events/') || req.url?.startsWith('/api/events?'))) { 
+          // Note: parsing logic needs to be careful about query params vs path path
+          // Let's assume /api/events/EVENT_ID pattern for simplicity, or handle both
+          
+          try {
+             const accounts = await this.tokenManager.loadAllAccounts();
+             if (accounts.size === 0) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Not authenticated' }));
+                return;
+             }
+
+             const body = await this.parseRequestBody(req);
+             
+             // Extract eventId from URL if present
+             let eventId = body.eventId;
+             // Simple regex to extract ID from path if it matches /api/events/ID
+             const pathMatch = req.url?.match(/^\/api\/events\/([^/?]+)/);
+             if (pathMatch && pathMatch[1]) {
+                eventId = pathMatch[1];
+             }
+
+             if (!eventId) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Event ID is required' }));
+                return;
+             }
+
+             const handler = new UpdateEventHandler();
+             const args = {
+                calendarId: 'primary', // Default
+                ...body,
+                eventId: eventId
+             };
+
+             const result = await handler.runTool(args, accounts);
+
+             if (result.content[0].type === 'text') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(result.content[0].text);
+             } else {
+                throw new Error('Unexpected result format from handler');
+             }
+
+          } catch (error) {
+             res.writeHead(500, { 'Content-Type': 'application/json' });
+             res.end(JSON.stringify({
+               error: 'Failed to update event',
+               message: error instanceof Error ? error.message : String(error)
+             }));
+          }
+          return;
+      }
+
+      // DELETE /api/events/:eventId - Delete event
+      if (req.method === 'DELETE' && (req.url?.startsWith('/api/events/'))) {
+         try {
+            const accounts = await this.tokenManager.loadAllAccounts();
+            if (accounts.size === 0) {
+               res.writeHead(401, { 'Content-Type': 'application/json' });
+               res.end(JSON.stringify({ error: 'Not authenticated' }));
+               return;
+            }
+
+            const url = new URL(req.url, `http://${host}:${port}`);
+            // Extract ID from path
+             const pathParts = url.pathname.split('/');
+             // Path is /api/events/ID -> ['', 'api', 'events', 'ID']
+             const eventId = pathParts[3];
+             const calendarId = url.searchParams.get('calendarId') || 'primary';
+
+             if (!eventId) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Event ID is required' }));
+                return;
+             }
+
+             const handler = new DeleteEventHandler();
+             const result = await handler.runTool({
+                calendarId,
+                eventId
+             }, accounts);
+
+             if (result.content[0].type === 'text') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(result.content[0].text);
+             } else {
+                throw new Error('Unexpected result format from handler');
+             }
+
+         } catch (error) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+               error: 'Failed to delete event',
+               message: error instanceof Error ? error.message : String(error)
+             }));
+         }
+         return;
       }
 
       try {
